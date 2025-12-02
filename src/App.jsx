@@ -1,13 +1,10 @@
-import React, { useState, useEffect, useMemo } from 'react';
-import { Upload, FileSpreadsheet, Trash2, Save, Loader2, CheckCircle, AlertCircle, Eye, X, Settings, Table, List } from 'lucide-react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { Upload, FileSpreadsheet, Trash2, Save, Loader2, AlertCircle, Eye, X, Settings, Table, List, ChevronRight, PenTool, CheckSquare, Square, Search, Users, ClipboardList, AlertTriangle, Server, Zap, Keyboard } from 'lucide-react';
 
-// 외부 라이브러리 로드 헬퍼 (CDN)
+// --- 외부 라이브러리 로드 (CDN) ---
 const loadScript = (src) => {
   return new Promise((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) {
-      resolve();
-      return;
-    }
+    if (document.querySelector(`script[src="${src}"]`)) { resolve(); return; }
     const script = document.createElement('script');
     script.src = src;
     script.onload = () => resolve();
@@ -16,55 +13,173 @@ const loadScript = (src) => {
   });
 };
 
-// 성적 등급 상수
+// --- 상수 ---
 const GRADES = ["매우 잘함", "잘함", "보통", "노력 요함"];
+// 과목-주제 통합으로 인해 정렬 순서는 가나다순을 기본으로 하되, 주요 과목 우선
+const SUBJECT_PRIORITY = ['국어', '수학', '사회', '과학', '영어', '도덕', '미술', '음악', '체육', '실과'];
 
+// --- 자동완성 입력 컴포넌트 ---
+const AutocompleteInput = ({ value, onChange, roster, placeholder, onNext }) => {
+    const [suggestions, setSuggestions] = useState([]);
+    const [showSuggestions, setShowSuggestions] = useState(false);
+    const [highlightIndex, setHighlightIndex] = useState(0);
+    const wrapperRef = useRef(null);
+
+    useEffect(() => {
+        if (showSuggestions && value) {
+            const cleanValue = value.trim();
+            if (!cleanValue) {
+                setSuggestions([]);
+                return;
+            }
+            const filtered = roster.filter(name => name.includes(cleanValue));
+            setSuggestions(filtered);
+            setHighlightIndex(0);
+        } else {
+            setSuggestions([]);
+        }
+    }, [value, showSuggestions, roster]);
+
+    const handleKeyDown = (e) => {
+        if (e.key === 'ArrowDown') {
+            e.preventDefault();
+            setHighlightIndex(prev => Math.min(prev + 1, suggestions.length - 1));
+        } else if (e.key === 'ArrowUp') {
+            e.preventDefault();
+            setHighlightIndex(prev => Math.max(prev - 1, 0));
+        } else if (e.key === 'Enter' || e.key === 'Tab') {
+            if (showSuggestions && suggestions.length > 0) {
+                e.preventDefault();
+                onChange(suggestions[highlightIndex]);
+                setShowSuggestions(false);
+                if(onNext) onNext();
+            }
+        } else if (e.key === 'Escape') {
+            setShowSuggestions(false);
+        }
+    };
+
+    const handleClickOutside = (e) => {
+        if (wrapperRef.current && !wrapperRef.current.contains(e.target)) {
+            setShowSuggestions(false);
+        }
+    };
+
+    useEffect(() => {
+        document.addEventListener("mousedown", handleClickOutside);
+        return () => document.removeEventListener("mousedown", handleClickOutside);
+    }, []);
+
+    return (
+        <div ref={wrapperRef} className="relative w-full h-full">
+            <input
+                type="text"
+                value={value || ''}
+                onChange={(e) => { onChange(e.target.value); setShowSuggestions(true); }}
+                onKeyDown={handleKeyDown}
+                onFocus={() => setShowSuggestions(true)}
+                className={`w-full h-full text-center bg-transparent outline-none font-bold text-slate-800 ${!value ? 'bg-red-50' : ''}`}
+                placeholder={placeholder}
+            />
+            {showSuggestions && suggestions.length > 0 && (
+                <ul className="absolute z-50 w-full bg-white border border-slate-300 shadow-lg max-h-40 overflow-y-auto left-0 top-full rounded-md text-left">
+                    {suggestions.map((name, idx) => (
+                        <li
+                            key={idx}
+                            onClick={() => { onChange(name); setShowSuggestions(false); }}
+                            className={`px-3 py-2 text-xs cursor-pointer ${idx === highlightIndex ? 'bg-indigo-100 text-indigo-900 font-bold' : 'hover:bg-slate-50'}`}
+                        >
+                            {name}
+                        </li>
+                    ))}
+                </ul>
+            )}
+        </div>
+    );
+};
+
+// --- 에러 바운더리 ---
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { hasError: false }; }
+  static getDerivedStateFromError(error) { return { hasError: true }; }
+  componentDidCatch(error, errorInfo) { console.error("Crash:", error, errorInfo); }
+  render() {
+    if (this.state.hasError) return <div className="flex h-screen items-center justify-center">일시적 오류가 발생했습니다. 새로고침 해주세요.</div>;
+    return this.props.children;
+  }
+}
+
+// --- 메인 컴포넌트 ---
 const PrivacyGradeManager = () => {
-  // 상태 관리
   const [files, setFiles] = useState([]);
   const [processing, setProcessing] = useState(false);
-  const [progress, setProgress] = useState(0);
   const [statusMessage, setStatusMessage] = useState('');
   const [results, setResults] = useState([]); 
+  
+  const [focusedItem, setFocusedItem] = useState(null);
   const [previewImage, setPreviewImage] = useState(null);
-  const [isEngineReady, setIsEngineReady] = useState(false);
+  const [serverStatus, setServerStatus] = useState('checking'); 
   const [viewMode, setViewMode] = useState('list'); 
   
-  // 점수 변환 설정 (기본값)
-  const [scoreSettings, setScoreSettings] = useState({
-    veryGood: 90, 
-    good: 80,     
-    average: 60,  
-  });
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [bulkSubject, setBulkSubject] = useState(''); // 과목-주제 통합 입력용
+  const [studentRoster, setStudentRoster] = useState([]);
+  const [showRosterModal, setShowRosterModal] = useState(false);
+  const [rosterInput, setRosterInput] = useState('');
+  const [scoreSettings, setScoreSettings] = useState({ veryGood: 90, good: 80, average: 60 });
   const [showSettings, setShowSettings] = useState(false);
 
-  // 초기 라이브러리 로드
+  const activeItem = useMemo(() => {
+    if (!focusedItem) return null;
+    return results.find(r => r.id === focusedItem.id) || null;
+  }, [results, focusedItem]);
+
+  // 스타일 주입
+  useEffect(() => {
+    const style = document.createElement('style');
+    style.innerHTML = `
+      html, body, #root { width: 100% !important; height: 100% !important; margin: 0 !important; padding: 0 !important; overflow: hidden !important; }
+      .grid-table { border-collapse: collapse; width: 100%; table-layout: fixed; background-color: white; }
+      .grid-table th, .grid-table td { border: 1px solid #94a3b8; padding: 0; vertical-align: middle; height: 42px; }
+      .grid-table th { background-color: #f1f5f9; font-weight: bold; text-align: center; color: #1e293b; padding: 8px; font-size: 13px; }
+      .grid-table input { width: 100%; height: 100%; border: none; background: transparent; outline: none; text-align: center; font-size: 14px; padding: 0 4px; font-weight: 500; color: #334155; }
+      .grid-table select { width: 100%; height: 100%; border: none; background: transparent; outline: none; cursor: pointer; text-align: center; text-align-last: center; font-size: 13px; font-weight: 600; color: #334155; }
+      .grid-table input:focus, .grid-table select:focus { background-color: #e0e7ff; }
+      .grid-table tr:hover { background-color: #f8fafc; }
+      .selected-row { background-color: #eff6ff !important; }
+      .missing-data { background-color: #fef2f2; }
+    `;
+    document.head.appendChild(style);
+    return () => { document.head.removeChild(style); };
+  }, []);
+
+  // 라이브러리 로드
   useEffect(() => {
     const initEngine = async () => {
       try {
-        setStatusMessage('AI 및 PDF 엔진을 로드 중입니다...');
         await Promise.all([
-          loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js'),
           loadScript('https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js'),
           loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js')
         ]);
-        
-        if (window.pdfjsLib) {
-          window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-        }
-
-        setIsEngineReady(true);
-        setStatusMessage('준비 완료');
-      } catch (error) {
-        console.error("라이브러리 로드 실패:", error);
-        setStatusMessage('엔진 로드 실패. 페이지를 새로고침해주세요.');
-      }
+        if (window.pdfjsLib) window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      } catch (error) { console.error("라이브러리 로드 실패:", error); }
     };
     initEngine();
   }, []);
 
-  // 점수 자동 변환 로직
+  // 서버 체크
+  useEffect(() => {
+      const check = async () => {
+          try { (await fetch('http://localhost:5000/health')).ok ? setServerStatus('connected') : setServerStatus('disconnected'); } 
+          catch { setServerStatus('disconnected'); }
+      };
+      check();
+      const interval = setInterval(check, 5000); 
+      return () => clearInterval(interval);
+  }, []);
+
   const convertScoreToGrade = (rawInput) => {
+    if (!rawInput) return "";
     if (GRADES.includes(rawInput)) return rawInput;
     const num = parseFloat(rawInput);
     if (!isNaN(num)) {
@@ -76,220 +191,377 @@ const PrivacyGradeManager = () => {
     return "";
   };
 
-  // 파일 업로드
   const handleFileUpload = (e) => {
     const uploadedFiles = Array.from(e.target.files);
-    if (files.length + uploadedFiles.length > 30) {
-      alert("파일은 최대 30개까지만 업로드할 수 있습니다.");
-      return;
+    if (files.length + uploadedFiles.length > 50) {
+      alert("한 번에 최대 50개까지 가능합니다."); return;
     }
     setFiles((prev) => [...prev, ...uploadedFiles]);
   };
 
-  // PDF 변환
   const convertPdfToImages = async (file) => {
     const fileUrl = URL.createObjectURL(file);
     const pdf = await window.pdfjsLib.getDocument(fileUrl).promise;
     const images = [];
     for (let i = 1; i <= pdf.numPages; i++) {
       const page = await pdf.getPage(i);
-      const viewport = page.getViewport({ scale: 1.5 });
+      const viewport = page.getViewport({ scale: 2.5 }); 
       const canvas = document.createElement('canvas');
       const context = canvas.getContext('2d');
-      canvas.height = viewport.height;
-      canvas.width = viewport.width;
+      canvas.height = viewport.height; canvas.width = viewport.width;
       await page.render({ canvasContext: context, viewport: viewport }).promise;
-      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg'));
-      images.push(new File([blob], `${file.name}_page${i}.jpg`, { type: 'image/jpeg' }));
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+      const res = await fetch(dataUrl);
+      images.push(new File([await res.blob()], `${file.name}_p${i}.jpg`, { type: 'image/jpeg' }));
     }
     return images;
   };
 
-  // OCR 처리
   const processFiles = async () => {
+    if (serverStatus !== 'connected') { alert("서버 연결이 필요합니다 (server.py 실행)"); return; }
     if (files.length === 0) return;
-    setProcessing(true);
-    setViewMode('list'); 
     
-    const processedFileNames = new Set(results.map(r => r.parentFileName));
-    const filesToProcess = files.filter(f => !processedFileNames.has(f.name));
+    setProcessing(true); setViewMode('list');
+    const processed = new Set(results.map(r => r.parentFileName));
+    const toProcess = files.filter(f => !processed.has(f.name));
+    
+    if (toProcess.length === 0) { setProcessing(false); alert('모두 처리되었습니다.'); return; }
 
-    if (filesToProcess.length === 0) {
-        setProcessing(false);
-        alert('모든 파일이 이미 처리되었습니다.');
-        return;
+    let allImages = [];
+    let convertCount = 0;
+    
+    for (const file of toProcess) {
+        setStatusMessage(`파일 변환 중... (${++convertCount}/${toProcess.length})`);
+        try {
+            if (file.type === 'application/pdf' || file.name.endsWith('.pdf')) {
+                const imgs = await convertPdfToImages(file);
+                allImages.push(...imgs.map(img => ({ fileObj: img, parentName: file.name })));
+            } else {
+                allImages.push({ fileObj: file, parentName: file.name });
+            }
+        } catch (e) { console.error(e); }
     }
 
-    let tempResults = [];
-    let totalSteps = filesToProcess.length;
-    let currentStep = 0;
+    const CONCURRENCY = 3;
+    let completed = 0;
+    // 파일별 고정값 (과목-주제)
+    const fileFixedInfo = {}; 
 
-    for (const file of filesToProcess) {
-      currentStep++;
-      setStatusMessage(`[${currentStep}/${totalSteps}] "${file.name}" 준비 중...`);
-      let imagesToScan = [];
-      
-      if (file.type === 'application/pdf') {
-        try {
-            setStatusMessage(`[${currentStep}/${totalSteps}] "${file.name}" PDF 변환 중...`);
-            imagesToScan = await convertPdfToImages(file);
-        } catch (e) {
-            console.error(e);
-            alert(`${file.name} PDF 변환 실패`);
-            continue;
+    const processImage = async (imgData) => {
+        const { fileObj, parentName } = imgData;
+        const formData = new FormData();
+        formData.append('file', fileObj);
+        if (studentRoster.length > 0) formData.append('roster', JSON.stringify(studentRoster));
+        
+        // 고정된 과목-주제가 있으면 전달 (서버 v41.0 대응: fixed_subject 하나만 씀)
+        if (fileFixedInfo[parentName]) {
+            formData.append('fixed_subject', fileFixedInfo[parentName]);
         }
-      } else {
-        imagesToScan = [file];
-      }
 
-      for (let i = 0; i < imagesToScan.length; i++) {
-        const targetImg = imagesToScan[i];
-        setStatusMessage(`[${currentStep}/${totalSteps}] "${file.name}" (Page ${i+1}) 분석 중...`);
         try {
-            const { data: { text } } = await window.Tesseract.recognize(
-                targetImg, 'kor+eng',
-                { logger: m => { if (m.status === 'recognizing text') setProgress(parseInt(m.progress * 100)); } }
-            );
+            const response = await fetch('http://localhost:5000/analyze', { method: 'POST', body: formData });
+            if (!response.ok) throw new Error('Server Error');
+            const data = await response.json();
 
-            const scoreMatch = text.match(/(\d{1,3})\s*점/);
-            const rawScore = scoreMatch ? scoreMatch[1] : '';
-            const nameMatch = text.match(/[가-힣]{3}/g);
-            const nameCandidate = nameMatch ? nameMatch[0] : '';
-            const subjects = ["국어", "수학", "영어", "과학", "사회", "역사", "도덕", "기가", "음악", "미술", "체육"];
-            const foundSubject = subjects.find(s => text.includes(s)) || "";
+            // 첫 페이지에서 과목-주제(subject)가 나오면 고정
+            // (서버 v41.0은 subject 필드에 "과목-주제"를 합쳐서 보냄)
+            if (!fileFixedInfo[parentName] && data.subject && data.subject !== "기타-수행평가") {
+                fileFixedInfo[parentName] = data.subject;
+            }
+            
+            const resSubject = fileFixedInfo[parentName] || data.subject || "기타-수행평가";
 
-            tempResults.push({
-                id: Date.now() + Math.random(),
-                parentFileName: file.name,
-                fileObj: targetImg,
-                rawText: text,
-                studentName: nameCandidate,
-                subject: foundSubject,
-                rawScore: rawScore,
-                grade: convertScoreToGrade(rawScore),
-                isVerified: false
-            });
-        } catch (err) { console.error(err); }
-      }
+            setResults(prev => [...prev, {
+                id: Date.now() + Math.random(), parentFileName: parentName, fileObj,
+                rawText: data.raw_text || "", studentName: data.name || "",
+                subject: resSubject, // 이제 여기에 '과목-주제'가 통째로 들어감
+                rawScore: data.rawScore || "", grade: convertScoreToGrade(data.rawScore) || data.rawScore,
+                cropName: data.crop_name, 
+                cropHigh: data.crop_high, 
+                cropLow: data.crop_low
+            }]);
+        } catch (err) {
+            setResults(prev => [...prev, {
+                id: Date.now() + Math.random(), parentFileName: parentName, fileObj,
+                rawText: "Error", studentName: "", subject: "분석실패", rawScore: "", grade: ""
+            }]);
+        } finally {
+            completed++;
+            setStatusMessage(`AI 분석 중... (${completed}/${allImages.length})`);
+        }
+    };
+
+    for (let i = 0; i < allImages.length; i += CONCURRENCY) {
+        const chunk = allImages.slice(i, i + CONCURRENCY);
+        await Promise.all(chunk.map(img => processImage(img)));
     }
-    setResults(prev => [...prev, ...tempResults]);
-    setProcessing(false);
-    setStatusMessage('분석 완료! 매트릭스 뷰에서 결과를 확인하세요.');
-    setProgress(0);
-    setViewMode('matrix'); 
+
+    setProcessing(false); setStatusMessage("완료");
   };
 
-  const updateResult = (id, field, value) => {
-    setResults(prev => prev.map(item => {
-        if (item.id !== id) return item;
-        const updated = { ...item, [field]: value, isVerified: true };
-        if (field === 'rawScore') updated.grade = convertScoreToGrade(value);
-        return updated;
-    }));
+  const updateResult = (id, f, v) => setResults(p => p.map(i => i.id===id ? {...i, [f]:v} : i));
+  const deleteResult = (id) => setResults(p => p.filter(i => i.id !== id));
+  const toggleSelect = (id) => {
+      const s = new Set(selectedIds);
+      s.has(id) ? s.delete(id) : s.add(id);
+      setSelectedIds(s);
+  };
+  const toggleSelectAll = () => setSelectedIds(selectedIds.size === results.length ? new Set() : new Set(results.map(r => r.id)));
+  
+  const applyBulkEdit = () => {
+      setResults(p => p.map(i => selectedIds.has(i.id) ? {...i, subject: bulkSubject||i.subject} : i));
+      setBulkSubject(''); setSelectedIds(new Set());
+      alert("수정되었습니다.");
   };
 
-  const deleteResult = (id) => { setResults(results.filter(r => r.id !== id)); };
+  const handleSaveRoster = () => {
+      setStudentRoster([...new Set(rosterInput.split(/[\n,]+/).map(s=>s.trim()).filter(s=>s.length>=2))].sort());
+      setShowRosterModal(false);
+  };
 
-  const matrixData = useMemo(() => {
-    const students = [...new Set(results.map(r => r.studentName).filter(n => n))].sort();
-    const subjects = [...new Set(results.map(r => r.subject).filter(s => s))];
-    const rows = students.map(student => {
-        const rowData = { studentName: student };
-        subjects.forEach(subj => {
-            const match = results.find(r => r.studentName === student && r.subject === subj);
-            rowData[subj] = match ? match.grade : '-';
-        });
-        return rowData;
-    });
-    return { students, subjects, rows };
+  const duplicateIds = useMemo(() => {
+      const counts = {}; const ids = new Set();
+      results.forEach(r => {
+          if (!r.studentName) return;
+          // 중복 체크 키: 이름 + 과목-주제
+          const key = `${r.studentName}-${r.subject}`;
+          if (!counts[key]) counts[key] = []; counts[key].push(r.id);
+      });
+      Object.values(counts).forEach(group => { if (group.length > 1) group.forEach(id => ids.add(id)); });
+      return ids;
   }, [results]);
 
+  const matrixData = useMemo(() => {
+      let students = studentRoster.length ? [...studentRoster] : [...new Set(results.map(r=>r.studentName).filter(n=>n))].sort();
+      
+      // 열 생성 (과목-주제 유니크)
+      const cols = [];
+      results.forEach(r => {
+          const k = r.subject || "기타-수행평가";
+          if(!cols.includes(k)) cols.push(k);
+      });
+      
+      // 정렬
+      cols.sort((a, b) => {
+          // 앞부분(과목)만 떼서 우선순위 비교
+          const subjA = a.split('-')[0];
+          const subjB = b.split('-')[0];
+          const idxA = SUBJECT_PRIORITY.indexOf(subjA);
+          const idxB = SUBJECT_PRIORITY.indexOf(subjB);
+          
+          if (idxA !== -1 && idxB !== -1) return idxA - idxB || a.localeCompare(b);
+          if (idxA !== -1) return -1;
+          if (idxB !== -1) return 1;
+          return a.localeCompare(b);
+      });
+
+      const rows = students.map(std => {
+          const row = { studentName: std };
+          cols.forEach(c => {
+              const m = results.find(r => r.studentName === std && (r.subject||"기타-수행평가")===c);
+              row[c] = m ? m.grade : null;
+          });
+          return row;
+      });
+      return { columns: cols, rows };
+  }, [results, studentRoster]);
+
   const exportToExcel = () => {
-    if (matrixData.rows.length === 0) { alert("내보낼 데이터가 없습니다."); return; }
-    if (!window.XLSX) return;
-    const ws = window.XLSX.utils.json_to_sheet(matrixData.rows);
-    const wb = window.XLSX.utils.book_new();
-    window.XLSX.utils.book_append_sheet(wb, ws, "성적일람표");
-    const rawData = results.map(r => ({
-        '파일': r.parentFileName, '학생': r.studentName, '과목': r.subject, '점수(숫자)': r.rawScore, '등급': r.grade
-    }));
-    const wsRaw = window.XLSX.utils.json_to_sheet(rawData);
-    window.XLSX.utils.book_append_sheet(wb, wsRaw, "상세데이터");
-    const date = new Date().toISOString().slice(0,10).replace(/-/g,"");
-    window.XLSX.writeFile(wb, `수행평가_매트릭스_${date}.xlsx`);
+      if (!window.XLSX) return alert("준비중...");
+      const data = matrixData.rows.map(r => {
+          const row = { '이름': r.studentName };
+          matrixData.columns.forEach(c => {
+              row[c] = r[c] || "";
+          });
+          return row;
+      });
+      const wb = window.XLSX.utils.book_new();
+      window.XLSX.utils.book_append_sheet(wb, window.XLSX.utils.json_to_sheet(data), "성적표");
+      window.XLSX.writeFile(wb, `성적표_${new Date().toISOString().slice(0,10)}.xlsx`);
+  };
+
+  const handleRowFocus = (item) => {
+      setFocusedItem(item);
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 p-6 font-sans text-slate-800">
-      <div className="w-full space-y-6">
-        <header className="bg-white p-6 rounded-xl shadow-sm border border-slate-200 flex justify-between items-center">
-          <div>
-            <div className="flex items-center gap-3 mb-2">
-                <div className="bg-indigo-600 p-2 rounded-lg"><FileSpreadsheet className="text-white w-6 h-6" /></div>
-                <h1 className="text-2xl font-bold text-slate-900">개인정보 안심 수행평가 매니저 Pro</h1>
-            </div>
-            <p className="text-slate-600 text-sm">PDF 지원 • 점수 자동 등급 변환 • 학생별 정렬<span className="ml-2 inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-green-100 text-green-800">🔒 로컬 보안 처리</span></p>
-          </div>
-          <button onClick={() => setShowSettings(!showSettings)} className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-slate-600 bg-slate-100 rounded-lg hover:bg-slate-200 transition-colors"><Settings className="w-4 h-4" /> 점수 기준 설정</button>
-        </header>
+    <ErrorBoundary>
+        <div className="w-full h-full bg-white flex flex-col font-sans text-slate-900">
+            <header className="bg-white border-b px-6 py-3 flex justify-between items-center z-20">
+                <div className="flex items-center gap-3">
+                    <div className={`p-2 rounded text-white ${serverStatus==='connected'?'bg-green-600':'bg-red-500'}`}><Server size={20}/></div>
+                    <h1 className="font-bold text-lg">개인정보 안심 수행평가 매니저 Pro <span className="text-xs font-normal text-slate-500 ml-2">{serverStatus==='connected' ? "● 서버 연결됨 (v41.0 UI)" : "● 서버 연결 안됨"}</span></h1>
+                </div>
+                <div className="flex gap-2">
+                    <button onClick={()=>setShowRosterModal(true)} className="px-3 py-2 bg-slate-100 rounded text-xs font-bold flex gap-2"><Users size={14}/> 명단 ({studentRoster.length})</button>
+                    <button onClick={()=>setShowSettings(!showSettings)} className="p-2 hover:bg-slate-100 rounded"><Settings size={18}/></button>
+                </div>
+            </header>
 
-        {showSettings && (
-            <div className="bg-white p-6 rounded-xl shadow-sm border border-indigo-100 bg-indigo-50/50">
-                <h3 className="font-semibold mb-4 text-indigo-900">점수 → 등급 자동 변환 기준 설정</h3>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                    <div className="flex items-center gap-3"><span className="w-24 font-medium text-sm text-slate-700">매우 잘함</span><input type="number" value={scoreSettings.veryGood} onChange={(e) => setScoreSettings({...scoreSettings, veryGood: parseInt(e.target.value)})} className="w-20 px-3 py-2 border rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500"/><span className="text-sm text-slate-500">점 이상</span></div>
-                    <div className="flex items-center gap-3"><span className="w-24 font-medium text-sm text-slate-700">잘함</span><input type="number" value={scoreSettings.good} onChange={(e) => setScoreSettings({...scoreSettings, good: parseInt(e.target.value)})} className="w-20 px-3 py-2 border rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500"/><span className="text-sm text-slate-500">점 이상</span></div>
-                    <div className="flex items-center gap-3"><span className="w-24 font-medium text-sm text-slate-700">보통</span><input type="number" value={scoreSettings.average} onChange={(e) => setScoreSettings({...scoreSettings, average: parseInt(e.target.value)})} className="w-20 px-3 py-2 border rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500"/><span className="text-sm text-slate-500">점 이상</span></div>
+            {showRosterModal && (
+                <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center" onClick={()=>setShowRosterModal(false)}>
+                    <div className="bg-white rounded-lg shadow-xl w-96 overflow-hidden" onClick={e=>e.stopPropagation()}>
+                        <div className="p-4 border-b flex justify-between font-bold"><span>학생 명단 등록</span><X size={18} onClick={()=>setShowRosterModal(false)} className="cursor-pointer"/></div>
+                        <textarea className="w-full h-64 p-4 text-sm outline-none resize-none" placeholder="김철수&#13;&#10;이영희 (줄바꿈으로 구분)" value={rosterInput} onChange={e=>setRosterInput(e.target.value)}/>
+                        <div className="p-4 border-t bg-slate-50 text-right"><button onClick={handleSaveRoster} className="bg-black text-white px-4 py-2 rounded text-xs font-bold">저장</button></div>
+                    </div>
                 </div>
-            </div>
-        )}
+            )}
+            {showSettings && (<div className="bg-slate-50 border-b px-6 py-3 text-xs flex gap-4 items-center shadow-inner"><span className="font-bold">기준:</span>{Object.entries(scoreSettings).map(([k,v]) => <div key={k} className="flex items-center gap-1"><span>{k}:</span><input type="number" value={v} onChange={e=>setScoreSettings({...scoreSettings, [k]:parseInt(e.target.value)})} className="w-10 border rounded text-center"/></div>)}</div>)}
 
-        <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 h-[700px]">
-            <div className="lg:col-span-1 flex flex-col gap-4">
-                <div className="bg-white p-5 rounded-xl shadow-sm border border-slate-200 flex-1 flex flex-col">
-                    <h2 className="font-semibold text-lg mb-4 flex items-center gap-2"><Upload className="w-5 h-5" /> 파일 등록</h2>
-                    <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-slate-300 rounded-lg cursor-pointer bg-slate-50 hover:bg-slate-100 transition-colors mb-4">
-                        <div className="flex flex-col items-center justify-center pt-5 pb-6"><Upload className="w-6 h-6 text-slate-400 mb-2" /><p className="text-xs text-slate-500 text-center"><span className="font-semibold">이미지/PDF 업로드</span><br/>(최대 30개)</p></div>
-                        <input type="file" className="hidden" multiple accept="image/*,application/pdf" onChange={handleFileUpload} />
-                    </label>
-                    <div className="text-sm text-slate-600 mb-4 space-y-1"><div className="flex justify-between"><span>등록된 파일:</span><span className="font-bold">{files.length} / 30</span></div><div className="flex justify-between"><span>분석된 페이지:</span><span className="font-bold">{results.length}</span></div></div>
-                    {!isEngineReady ? ( <button disabled className="w-full py-2.5 rounded-lg flex items-center justify-center gap-2 text-white bg-slate-400 text-sm"><Loader2 className="w-4 h-4 animate-spin" /> 엔진 로딩 중...</button> ) : ( <button onClick={processFiles} disabled={processing || files.length === 0} className={`w-full py-2.5 rounded-lg flex items-center justify-center gap-2 font-medium text-white transition-all text-sm ${processing || files.length === 0 ? 'bg-slate-400 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700 shadow-md'}`}>{processing ? <Loader2 className="w-4 h-4 animate-spin" /> : '분석 및 정리 시작'}</button> )}
-                    {processing && (<div className="mt-4 p-3 bg-blue-50 text-blue-700 text-xs rounded-lg animate-pulse"><p className="font-semibold mb-1">분석 진행률: {progress}%</p><p>{statusMessage}</p></div>)}
-                </div>
-            </div>
-            <div className="lg:col-span-3 flex flex-col bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
-                <div className="flex border-b border-slate-200">
-                    <button onClick={() => setViewMode('list')} className={`flex-1 py-3 text-sm font-medium flex items-center justify-center gap-2 ${viewMode === 'list' ? 'bg-white text-indigo-600 border-b-2 border-indigo-600' : 'bg-slate-50 text-slate-500 hover:bg-slate-100'}`}><List className="w-4 h-4" /> 데이터 검수 (개별 수정)</button>
-                    <button onClick={() => setViewMode('matrix')} className={`flex-1 py-3 text-sm font-medium flex items-center justify-center gap-2 ${viewMode === 'matrix' ? 'bg-white text-indigo-600 border-b-2 border-indigo-600' : 'bg-slate-50 text-slate-500 hover:bg-slate-100'}`}><Table className="w-4 h-4" /> 최종 성적표 (학생별 정렬)</button>
-                </div>
-                <div className="flex-1 overflow-hidden relative">
-                    {results.length === 0 && !processing && (<div className="absolute inset-0 flex flex-col items-center justify-center text-slate-400"><FileSpreadsheet className="w-16 h-16 mb-4 opacity-20" /><p>왼쪽에서 파일을 업로드하고 분석을 시작하세요.</p></div>)}
-                    {viewMode === 'list' && results.length > 0 && (
-                        <div className="h-full overflow-auto p-4">
-                            <table className="w-full text-sm text-left border-collapse">
-                                <thead className="text-xs text-slate-500 uppercase bg-slate-50 sticky top-0 z-10"><tr><th className="px-3 py-3 w-14 text-center border-b">원본</th><th className="px-3 py-3 border-b">학생 이름</th><th className="px-3 py-3 border-b">과목</th><th className="px-3 py-3 w-24 border-b">점수(숫자)</th><th className="px-3 py-3 w-32 border-b">최종 등급</th><th className="px-3 py-3 w-12 text-center border-b">삭제</th></tr></thead>
-                                <tbody className="divide-y divide-slate-100">{results.map((item) => (<tr key={item.id} className="hover:bg-slate-50 group"><td className="px-3 py-2 text-center"><button onClick={() => setPreviewImage(item.fileObj)} className="p-1 border rounded hover:border-indigo-500"><Eye className="w-4 h-4 text-slate-400 hover:text-indigo-500" /></button></td><td className="px-3 py-2"><input type="text" value={item.studentName} onChange={(e) => updateResult(item.id, 'studentName', e.target.value)} className="w-full bg-transparent border-b border-transparent focus:border-indigo-500 focus:outline-none py-1" placeholder="이름 확인 필요"/></td><td className="px-3 py-2"><input type="text" value={item.subject} onChange={(e) => updateResult(item.id, 'subject', e.target.value)} className="w-full bg-transparent border-b border-transparent focus:border-indigo-500 focus:outline-none py-1" placeholder="과목 입력"/></td><td className="px-3 py-2"><input type="text" value={item.rawScore} onChange={(e) => updateResult(item.id, 'rawScore', e.target.value)} className="w-full bg-transparent border-b border-transparent focus:border-indigo-500 focus:outline-none py-1 font-mono text-center" placeholder="-"/></td><td className="px-3 py-2"><select value={item.grade} onChange={(e) => updateResult(item.id, 'grade', e.target.value)} className={`w-full text-xs py-1 rounded border-none focus:ring-1 focus:ring-indigo-500 ${item.grade === '매우 잘함' ? 'bg-green-100 text-green-800' : item.grade === '잘함' ? 'bg-blue-100 text-blue-800' : item.grade === '보통' ? 'bg-yellow-100 text-yellow-800' : 'bg-red-50 text-red-800'}`}><option value="">(선택)</option>{GRADES.map(g => <option key={g} value={g}>{g}</option>)}</select></td><td className="px-3 py-2 text-center"><button onClick={() => deleteResult(item.id)} className="text-slate-300 hover:text-red-500"><Trash2 className="w-4 h-4" /></button></td></tr>))}</tbody>
-                            </table>
+            <div className="flex-1 flex overflow-hidden">
+                {/* 왼쪽 사이드바: 3단 분할 스마트 뷰어 */}
+                <div className="w-[500px] bg-white border-r z-10 flex flex-col">
+                    <div className="p-5 flex-1 overflow-y-auto flex flex-col">
+                         <div className="mb-6 border-b pb-6 flex-1 flex flex-col">
+                            <h3 className="text-sm font-bold mb-3 text-indigo-800 flex items-center gap-2"><Eye size={16}/> 스마트 뷰어 (3단 확인)</h3>
+                            
+                            {activeItem ? (
+                                <div className="flex-1 space-y-2 flex flex-col h-full min-h-0">
+                                    {/* 1단: 이름 */}
+                                    <div className="flex-1 bg-slate-100 rounded border overflow-hidden relative min-h-[100px]">
+                                        <span className="absolute top-1 left-1 bg-black/50 text-white text-[10px] px-2 rounded z-10">1. 이름 영역</span>
+                                        {activeItem.cropName ? (
+                                            <img src={`data:image/jpeg;base64,${activeItem.cropName}`} className="w-full h-full object-contain"/>
+                                        ) : (
+                                            <div className="w-full h-full flex items-center justify-center text-xs text-slate-400">이미지 없음 (전체보기 권장)</div>
+                                        )}
+                                    </div>
+                                    {/* 2단: 상위 등급 */}
+                                    <div className="flex-1 bg-slate-100 rounded border overflow-hidden relative min-h-[100px]">
+                                        <span className="absolute top-1 left-1 bg-blue-600/70 text-white text-[10px] px-2 rounded z-10">2. 매우잘함 / 잘함</span>
+                                        {activeItem.cropHigh ? (
+                                            <img src={`data:image/jpeg;base64,${activeItem.cropHigh}`} className="w-full h-full object-contain"/>
+                                        ) : (
+                                            <div className="w-full h-full flex items-center justify-center text-xs text-slate-400">이미지 없음</div>
+                                        )}
+                                    </div>
+                                    {/* 3단: 하위 등급 */}
+                                    <div className="flex-1 bg-slate-100 rounded border overflow-hidden relative min-h-[100px]">
+                                        <span className="absolute top-1 left-1 bg-orange-600/70 text-white text-[10px] px-2 rounded z-10">3. 보통 / 노력요함</span>
+                                        {activeItem.cropLow ? (
+                                            <img src={`data:image/jpeg;base64,${activeItem.cropLow}`} className="w-full h-full object-contain"/>
+                                        ) : (
+                                            <div className="w-full h-full flex items-center justify-center text-xs text-slate-400">이미지 없음</div>
+                                        )}
+                                    </div>
+                                    
+                                    <div className="mt-2 text-center">
+                                        <div className="text-xl font-bold text-indigo-700">{activeItem.studentName || "(이름 없음)"}</div>
+                                        <p className="text-xs text-slate-400 mt-1">오른쪽 표에서 성적을 선택하세요.</p>
+                                    </div>
+                                </div>
+                            ) : (
+                                <div className="h-full flex items-center justify-center bg-slate-50 rounded border text-slate-400 text-sm text-center p-4">
+                                    오른쪽 목록에서<br/>학생을 클릭하면<br/>확대 이미지가 보입니다.
+                                </div>
+                            )}
                         </div>
-                    )}
-                    {viewMode === 'matrix' && results.length > 0 && (
-                        <div className="h-full flex flex-col">
-                            <div className="flex justify-between items-center p-4 bg-indigo-50/30 border-b border-indigo-100"><div className="text-sm text-indigo-900"><span className="font-bold">{matrixData.students.length}명</span>의 학생, <span className="font-bold ml-1">{matrixData.subjects.length}개</span> 과목이 집계되었습니다.</div><button onClick={exportToExcel} className="flex items-center gap-2 bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700 text-sm font-medium shadow-sm"><Save className="w-4 h-4" /> 엑셀 다운로드</button></div>
-                            <div className="flex-1 overflow-auto p-4">
-                                <table className="w-full text-sm border-collapse border border-slate-300">
-                                    <thead className="bg-slate-100 text-slate-700 font-semibold sticky top-0 z-10 shadow-sm"><tr><th className="border border-slate-300 px-4 py-2 bg-slate-100">이름 \ 과목</th>{matrixData.subjects.map(subj => (<th key={subj} className="border border-slate-300 px-4 py-2 min-w-[100px]">{subj || "(과목미상)"}</th>))}</tr></thead>
-                                    <tbody>{matrixData.rows.map((row, idx) => (<tr key={idx} className="hover:bg-indigo-50/50 even:bg-slate-50"><td className="border border-slate-300 px-4 py-2 font-medium text-slate-900 bg-white sticky left-0 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.1)]">{row.studentName || "(이름미상)"}</td>{matrixData.subjects.map(subj => { const val = row[subj]; return (<td key={subj} className="border border-slate-300 px-4 py-2 text-center"><span className={`inline-block px-2 py-0.5 rounded text-xs ${val === '매우 잘함' ? 'bg-green-100 text-green-800' : val === '잘함' ? 'bg-blue-100 text-blue-800' : val === '보통' ? 'bg-yellow-100 text-yellow-800' : val === '노력 요함' ? 'bg-red-50 text-red-800' : 'text-slate-400'}`}>{val}</span></td>); })}</tr>))}</tbody>
+
+                        <div className="mb-2">
+                            <label className="flex flex-col items-center justify-center w-full h-16 border-2 border-dashed rounded-lg hover:bg-slate-50 cursor-pointer">
+                                <span className="text-xs text-slate-500 font-bold flex items-center gap-1"><Upload size={12}/> 파일 추가</span>
+                                <input type="file" className="hidden" multiple onChange={handleFileUpload} />
+                            </label>
+                        </div>
+                        <button onClick={processFiles} disabled={processing} className="w-full py-2 bg-black text-white rounded text-xs font-bold flex justify-center gap-2 disabled:bg-slate-300">
+                            {processing ? <Loader2 className="animate-spin" size={14}/> : <ChevronRight size={14}/>} 분석 시작 ({files.length})
+                        </button>
+                        {processing && <div className="text-center text-xs text-indigo-600 mt-2">{statusMessage}</div>}
+                    </div>
+                </div>
+
+                {/* 메인 뷰어 */}
+                <div className="flex-1 flex flex-col bg-slate-100 overflow-hidden">
+                    <div className="bg-white border-b px-4 flex gap-1 pt-2 shrink-0">
+                        <button onClick={()=>setViewMode('list')} className={`px-4 py-2 text-xs font-bold rounded-t border-t border-x ${viewMode==='list'?'bg-white border-b-white':'bg-slate-50 text-slate-500'}`}>1. 검수 (입력)</button>
+                        <button onClick={()=>setViewMode('matrix')} className={`px-4 py-2 text-xs font-bold rounded-t border-t border-x ${viewMode==='matrix'?'bg-white border-b-white':'bg-slate-50 text-slate-500'}`}>2. 성적표</button>
+                        <div className="ml-auto pb-2"><button onClick={exportToExcel} className="bg-green-600 text-white px-3 py-1.5 rounded text-xs font-bold flex gap-1"><Save size={14}/> 엑셀</button></div>
+                    </div>
+
+                    <div className="flex-1 overflow-auto p-6">
+                        {results.length === 0 && !processing && (
+                            <div className="h-full flex flex-col items-center justify-center text-slate-400"><FileSpreadsheet size={48} className="mb-4 opacity-50"/><p className="text-lg font-bold">데이터가 없습니다</p></div>
+                        )}
+
+                        {(results.length > 0 || processing) && viewMode === 'list' && (
+                            <div className="max-w-6xl mx-auto pb-20">
+                                <div className="bg-white p-3 rounded shadow-sm border mb-4 flex items-center gap-3 sticky top-0 z-30">
+                                    <button onClick={toggleSelectAll} className="flex items-center gap-1 text-xs font-bold">{selectedIds.size===results.length?<CheckSquare size={14}/>:<Square size={14}/>} 전체 ({selectedIds.size})</button>
+                                    <div className="h-4 w-px bg-slate-300"></div>
+                                    <span className="text-xs font-bold flex gap-1"><PenTool size={12}/> 일괄:</span>
+                                    <input className="border rounded px-2 py-1 text-xs w-40" placeholder="과목-주제 (예: 수학-덧셈)" value={bulkSubject} onChange={e=>setBulkSubject(e.target.value)}/>
+                                    <button onClick={applyBulkEdit} className="bg-black text-white px-3 py-1 rounded text-xs font-bold">적용</button>
+                                </div>
+                                <div className="bg-white rounded-xl shadow-sm border overflow-hidden">
+                                    <table className="grid-table">
+                                        <thead><tr><th className="w-10"></th><th className="w-20">확인</th><th>이름 (자동완성)</th><th>과목-주제(단원)</th><th className="w-16">점수</th><th className="w-24">등급</th><th className="w-10"></th></tr></thead>
+                                        <tbody>
+                                            {results.map((r, index) => (
+                                                <tr key={r.id} 
+                                                    className={`${selectedIds.has(r.id)?'selected-row':''} ${duplicateIds.has(r.id)?'bg-red-50':''}`}
+                                                    onClick={() => handleRowFocus(r)}
+                                                >
+                                                    <td className="text-center" onClick={(e)=>{e.stopPropagation(); toggleSelect(r.id)}}>{selectedIds.has(r.id)?<CheckSquare size={14} className="mx-auto text-indigo-600"/>:<Square size={14} className="mx-auto text-slate-300"/>}</td>
+                                                    <td className="text-center p-1"><div className="w-16 h-8 bg-slate-100 mx-auto cursor-pointer overflow-hidden relative group" onClick={(e)=>{e.stopPropagation(); setPreviewImage(r.fileObj)}}><img src={URL.createObjectURL(r.fileObj)} className="w-full h-full object-cover object-top"/><div className="absolute inset-0 bg-black/10 flex items-center justify-center hidden group-hover:flex"><Eye size={12} className="text-white"/></div></div></td>
+                                                    <td className="relative">
+                                                        <AutocompleteInput 
+                                                            value={r.studentName} 
+                                                            roster={studentRoster}
+                                                            placeholder="이름 입력 (Tab)"
+                                                            onChange={(val) => updateResult(r.id, 'studentName', val)}
+                                                        />
+                                                        {duplicateIds.has(r.id) && <div className="absolute right-2 top-3 text-red-500"><AlertTriangle size={12}/></div>}
+                                                    </td>
+                                                    {/* [수정] 과목-주제 통합 열 */}
+                                                    <td><input value={r.subject} onChange={e=>updateResult(r.id,'subject',e.target.value)} placeholder="예: 수학-1단원"/></td>
+                                                    <td><input value={r.rawScore} onChange={e=>updateResult(r.id,'rawScore',e.target.value)}/></td>
+                                                    <td>
+                                                        <select value={r.grade} onChange={e=>updateResult(r.id,'grade',e.target.value)}>
+                                                            <option value="">- 선택 -</option>
+                                                            {GRADES.map(g=><option key={g} value={g}>{g}</option>)}
+                                                        </select>
+                                                    </td>
+                                                    <td className="text-center"><Trash2 size={14} className="mx-auto text-slate-300 hover:text-red-500 cursor-pointer" onClick={()=>deleteResult(r.id)}/></td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* 성적표 뷰 (Matrix Mode) */}
+                        {(results.length > 0 || processing) && viewMode === 'matrix' && (
+                            <div className="bg-white rounded border shadow-sm overflow-auto">
+                                <table className="grid-table">
+                                    <thead>
+                                        {/* [수정] 헤더 통합 */}
+                                        <tr><th className="w-32 sticky left-0 bg-slate-50 z-10">이름 \ 과목-주제</th>{matrixData.columns.map((c,i)=><th key={i}><div className="text-xs px-2">{c}</div></th>)}</tr>
+                                    </thead>
+                                    <tbody>
+                                        {matrixData.rows.map((r,i) => (
+                                            <tr key={i}>
+                                                <td className="font-bold sticky left-0 bg-white z-10">{r.studentName}</td>
+                                                {matrixData.columns.map((c,j) => {
+                                                    const val = r[c];
+                                                    return <td key={j} className={val===null?'missing-data':''}><select value={val||""} onChange={e=>{
+                                                        const t = results.find(x=>x.studentName===r.studentName && (x.subject||"기타-수행평가")===c);
+                                                        if(t) updateResult(t.id,'grade',e.target.value);
+                                                    }}>{val===null?<option>-</option>:null}{GRADES.map(g=><option key={g} value={g}>{g}</option>)}</select></td>
+                                                })}
+                                            </tr>
+                                        ))}
+                                    </tbody>
                                 </table>
                             </div>
-                        </div>
-                    )}
+                        )}
+                    </div>
                 </div>
+                {previewImage && <div className="fixed inset-0 bg-black/90 z-50 flex items-center justify-center p-10" onClick={()=>setPreviewImage(null)}><img src={URL.createObjectURL(previewImage)} className="max-w-full max-h-full shadow-2xl"/></div>}
             </div>
         </div>
-        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 flex items-start gap-2 text-xs text-yellow-800"><AlertCircle className="w-4 h-4 shrink-0 mt-0.5" /><p><strong>보안 주의사항:</strong> 이 프로그램은 구조적으로 외부 서버와 통신하지 않도록 설계되었습니다. 모든 데이터 처리는 선생님의 컴퓨터(브라우저 메모리)에서만 수행되며, 페이지를 새로고침하면 모든 데이터가 사라집니다. 중요한 작업 후에는 반드시 "엑셀 다운로드"를 눌러 결과를 저장하세요.</p></div>
-        {previewImage && (<div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4 backdrop-blur-sm" onClick={() => setPreviewImage(null)}><div className="bg-white rounded-lg p-2 max-w-4xl max-h-[90vh] relative shadow-2xl flex flex-col" onClick={e => e.stopPropagation()}><div className="flex justify-between items-center p-2 border-b mb-2"><span className="font-semibold text-slate-700 text-sm">원본 이미지 확인</span><button onClick={() => setPreviewImage(null)} className="p-1 hover:bg-slate-100 rounded-full"><X className="w-5 h-5" /></button></div><div className="overflow-auto flex-1 bg-slate-100 flex items-center justify-center min-h-[300px]"><img src={URL.createObjectURL(previewImage)} alt="preview" className="max-w-full max-h-[70vh] object-contain shadow-md"/></div></div></div>)}
-      </div>
-    </div>
+    </ErrorBoundary>
   );
 };
 export default PrivacyGradeManager;
